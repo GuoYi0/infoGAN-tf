@@ -56,12 +56,16 @@ def generatorNet(name, inputs, is_training, use_batchNorm, reuse=None):
     return f
 
 
-def discriminator_forward(
-        name, inputs, is_training, use_batchNorm=True, reuse=None):
+def discriminator(
+        name, inputs, is_training, num_category, num_continuous, use_batchNorm=True, reuse=None):
     with tf.variable_scope(name, reuse=reuse):
         out = discriminatorNet(inputs, is_training, use_batchNorm)
-        prob = layers.dense(out, 1, activation=tf.nn.sigmoid, name="discriminator_out")
-    return {"prob": prob, "hidden": out}
+        prob = layers.dense(out, 1, activation=None, name="discriminator_out")
+        # with tf.variable_scope("mutual", reuse=reuse):
+        f = layers.dense(out, 128)
+        f = tf.nn.leaky_relu(f, 0.01)
+        f = layers.dense(f, units=num_category + num_continuous, activation=None)
+    return {"prob_logits": prob, "q_logits": f}
 
 
 def discriminatorNet(inputs, is_training, use_batchNorm):
@@ -167,91 +171,59 @@ def main():
     is_training_discriminator = tf.placeholder(tf.bool, [], name="is_training_discriminator")
     is_training_generator = tf.placeholder(tf.bool, [], name="is_training_generator")
 
+    # 生成图片
     fake_images = generatorNet(
         name="generator", inputs=zc_vectors, use_batchNorm=True, is_training=is_training_generator)
 
+    # 训练判别器=======================================================================, 输入是真假图片
+    images = tf.concat([fake_images, true_images], axis=0)  # [假，真] 图片
+    disc = discriminator(
+        name="discriminator", inputs=images, is_training=is_training_discriminator,
+        use_batchNorm=True, reuse=None, num_category=cfg.num_category, num_continuous=cfg.num_continuous)
+    labels_bool = tf.concat([tf.zeros((cfg.batch_size,), tf.float32), tf.ones((cfg.batch_size,), tf.float32)],
+                            axis=0)  # [假真]图片
+    labels_bool = tf.print(labels_bool, [tf.shape(labels_bool)], "haha")
+    pp = disc["prob_logits"] # shape 有时候是[81]， 不知为啥
+    discriminator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=labels_bool[..., tf.newaxis], logits=pp))
 
+    labels_catrgory = tf.concat([zc_vectors[:, :cfg.num_category], true_labels], axis=0)  # [假，真] 类别标签
+    q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
+        labels=true_labels, logits=disc["q_logits"][cfg.batch_size:, :cfg.num_category])) #只用真实图片来做类别训练！！
 
+    final_dis_loss = discriminator_loss + cfg.categorical_lambda * q_cat_loss
+    if cfg.num_continuous > 0:
+        labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
+        q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:cfg.batch_size, cfg.num_category:]))
+        final_dis_loss += cfg.continuous_lambda * q_cont_loss
 
+    # 训练生成器 ===============================================================， 输入是假图片
+    disc = discriminator(
+        name="discriminator", inputs=fake_images, is_training=is_training_discriminator,
+        use_batchNorm=True, reuse=True, num_category=cfg.num_category, num_continuous=cfg.num_continuous)
+    labels_bool = tf.ones((cfg.batch_size,), tf.float32)
+    generator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=labels_bool[..., tf.newaxis], logits=disc["prob_logits"]))
+    labels_catrgory = zc_vectors[:, :cfg.num_category]
+    q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
+        labels=labels_catrgory, logits=disc["q_logits"][:, :cfg.num_category]))
 
+    final_gen_loss = generator_loss + cfg.categorical_lambda * q_cat_loss
+    if cfg.num_continuous > 0:
+        labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
+        q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:, cfg.num_category:]))
+        final_gen_loss += cfg.continuous_lambda * q_cont_loss
 
-    discriminator_fake = discriminator_forward(
-        name="discriminator", inputs=fake_images, is_training=is_training_discriminator, use_batchNorm=True, reuse=None)
-    prob_fake = discriminator_fake["prob"]
-    discriminator_true = discriminator_forward(
-        name="discriminator", inputs=true_images, is_training=is_training_discriminator, use_batchNorm=True, reuse=True)
-    prob_true = discriminator_true["prob"]
-
-    # 训练判别器，需要最小化的一些量
-    ll_believing_fake_images_are_fake = -tf.log(1.0 - prob_fake + 1e-6)
-    ll_true_images = -tf.log(prob_true + 1e-6)
-
-    categorical_c_vectors = []
-    offset = 0
-    for cardinality in cfg.categorical_cardinality:
-        categorical_c_vectors.append(zc_vectors[:, offset:offset + cardinality])
-        offset += cardinality
-    continuous_c_vector = zc_vectors[:, offset:offset + cfg.num_continuous]
-    q_output = reconstruct_mutual_info(
-        categorical_c_vectors,
-        continuous_c_vector,
-        true_labels,
-        categorical_lambda=cfg.categorical_lambda,
-        continuous_lambda=cfg.continuous_lambda,
-        fix_std=cfg.fix_std,
-        hidden=discriminator_fake["hidden"],
-        is_training=is_training_discriminator,
-        name="mutual_info"
-    )
-    discriminator_obj = tf.reduce_mean(ll_believing_fake_images_are_fake) + tf.reduce_mean(ll_true_images)
-
-
-
-
-    # generator should maximize:
-    ll_believing_fake_images_are_real = tf.reduce_mean(tf.log(prob_fake + 1e-6))
-    generator_obj = ll_believing_fake_images_are_real
-
-    # discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
-    # generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
     discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
     generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
 
     discriminator_variables = scope_variables("discriminator")
     generator_variables = scope_variables("generator")
 
-    train_discriminator = discriminator_solver.minimize(-discriminator_obj, var_list=discriminator_variables)
-    train_generator = generator_solver.minimize(-generator_obj, var_list=generator_variables)
-    discriminator_obj_summary = tf.summary.scalar("discriminator_objective", discriminator_obj)
-    generator_obj_summary = tf.summary.scalar("generator_objective", generator_obj)
-
-    if cfg.useInfoGan:
-
-        mutual_info_objective = q_output["mutual_info"]
-        mutual_info_variables = scope_variables("mutual_info")
-        neg_mutual_info_objective = -mutual_info_objective
-        train_mutual_info = generator_solver.minimize(
-            neg_mutual_info_objective,
-            var_list=generator_variables + discriminator_variables + mutual_info_variables
-        )
-        ll_categorical = q_output["ll_categorical"]
-        ll_continuous = q_output["ll_continuous"]
-        std_contig = q_output["std_contig"]
-
-        mutual_info_obj_summary = tf.summary.scalar("mutual_info_objective", mutual_info_objective)
-        ll_categorical_obj_summary = tf.summary.scalar("ll_categorical_objective", ll_categorical)
-        ll_continuous_obj_summary = tf.summary.scalar("ll_continuous_objective", ll_continuous)
-        std_contig_summary = tf.summary.scalar("std_contig", std_contig)
-        generator_obj_summary = tf.summary.merge([
-            generator_obj_summary,
-            mutual_info_obj_summary,
-            ll_categorical_obj_summary,
-            ll_continuous_obj_summary,
-            std_contig_summary
-        ])
-    else:
-        neg_mutual_info_objective = tf.no_op()
-        train_mutual_info = tf.no_op()
+    train_discriminator = discriminator_solver.minimize(final_dis_loss, var_list=discriminator_variables)
+    train_generator = generator_solver.minimize(final_gen_loss, var_list=generator_variables)
+    discriminator_obj_summary = tf.summary.scalar("discriminator_objective", final_dis_loss)
+    generator_obj_summary = tf.summary.scalar("generator_objective", final_gen_loss)
 
     log_dir = next_unused_name(
         join(
@@ -261,19 +233,13 @@ def main():
         )
     )
     journalist = tf.summary.FileWriter(log_dir, flush_secs=10)
-    img_summaries = {}
-    if cfg.useInfoGan:
-        plotter = CategoricalPlotter(
-            journalist=journalist,
-            categorical_cardinality=cfg.categorical_cardinality,
-            num_continuous=cfg.num_continuous,
-            style_size=cfg.style_size,
-            generate=lambda s, x: s.run(fake_images, {zc_vectors: x, is_training_discriminator: False,
-                                                      is_training_generator: False}))
-    else:
-        plotter = None
-        img_summaries["fake_images"] = tf.summary.image("fake images", fake_images, max_images=10)
-    image_summary_op = tf.summary.merge(list(img_summaries.values())) if len(img_summaries) else tf.no_op()
+    plotter = CategoricalPlotter(
+        journalist=journalist,
+        categorical_cardinality=cfg.num_category,
+        num_continuous=cfg.num_continuous,
+        style_size=cfg.style_size,
+        generate=lambda s, x: s.run(fake_images, {zc_vectors: x, is_training_discriminator: False,
+                                                  is_training_generator: False}))
     idxes = np.arange(n_images, dtype=np.int32)
     iters = 0
     saver = tf.train.Saver(max_to_keep=100)
@@ -282,7 +248,6 @@ def main():
         for epoch in range(cfg.n_epochs):
             disc_epoch_obj = []
             gen_epoch_obj = []
-            infogan_epoch_obj = []
 
             shuffle(idxes)
             pbar = create_progress_bar("epoch %d >> " % (epoch,))
@@ -290,26 +255,22 @@ def main():
                 batch = X[0][idxes[idx: idx + cfg.batch_size]]  # true image
                 labels = X[1][idxes[idx: idx + cfg.batch_size]]  # true image
                 noise = sample_noise(cfg.batch_size)
-                # 训练判别器和互信息
-                _, _, summary_result1, disc_obj, infogan_obj = sess.run(
-                    [train_discriminator, train_mutual_info, discriminator_obj_summary, discriminator_obj,
-                     neg_mutual_info_objective],
+                # 训练判别器
+                _, summary_result1, disc_obj = sess.run(
+                    [train_discriminator, discriminator_obj_summary, final_dis_loss],
                     feed_dict={
                         true_images: batch,
                         zc_vectors: noise,
                         is_training_discriminator: True,
-                        is_training_generator: True
+                        is_training_generator: True,
+                        true_labels: labels
                     }
                 )
                 disc_epoch_obj.append(disc_obj)
-                if cfg.useInfoGan:
-                    infogan_epoch_obj.append(infogan_obj)
-
                 # 训练生成器和互信息
                 noise = sample_noise(cfg.batch_size)
-                _, _, summary_result2, gen_obj, infogan_obj = sess.run(
-                    [train_generator, train_mutual_info, generator_obj_summary, generator_obj,
-                     neg_mutual_info_objective],
+                _, summary_result2, gen_obj = sess.run(
+                    [train_generator,  generator_obj_summary, final_gen_loss],
                     feed_dict={
                         zc_vectors: noise,
                         is_training_discriminator: True,
@@ -321,35 +282,19 @@ def main():
                 journalist.add_summary(summary_result2, iters)
                 journalist.flush()
                 gen_epoch_obj.append(gen_obj)
-                if cfg.useInfoGan:
-                    infogan_epoch_obj.append(infogan_obj)
                 iters += 1
 
                 if iters % cfg.plot_every == 0:
-                    if cfg.useInfoGan:
-                        plotter.generate_images(sess, 10, iteration=iters)
-                    else:
-                        noise = sample_noise(cfg.batch_size)
-                        current_summary = sess.run(
-                            image_summary_op,
-                            {
-                                zc_vectors: noise,
-                                is_training_discriminator: False,
-                                is_training_generator: False
-                            }
-                        )
-                        journalist.add_summary(current_summary, iters)
+                    plotter.generate_images(sess, 10, iteration=iters)
                     journalist.flush()
                     ckpt_file = join(cfg.ckpt, "gan")
-                    saver.save(sess, cfg.ckpt, ckpt_file, iters)
+                    saver.save(sess, ckpt_file, iters)
 
-            msg = "epoch %d >> discriminator LL %.2f (lr=%.6f), generator LL %.2f (lr=%.6f)" % (
+            msg = "epoch %d >> discriminator loss %.2f (lr=%.6f), generator loss %.2f (lr=%.6f)" % (
                 epoch,
                 np.mean(disc_epoch_obj), sess.run(discriminator_lr),
                 np.mean(gen_epoch_obj), sess.run(generator_lr)
             )
-            if cfg.useInfoGan:
-                msg = msg + ", infogan loss %.2f" % (np.mean(infogan_epoch_obj),)
             print(msg)
 
 

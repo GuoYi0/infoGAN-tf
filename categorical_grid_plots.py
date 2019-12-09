@@ -1,12 +1,9 @@
 import numpy as np
 import tensorflow as tf
 from PIL import Image
-from noise_utils import (
-    create_continuous_noise, create_categorical_noise, encode_infogan_noise
-)
 
 
-def create_image_strip(images, zoom=1, gutter=5):
+def create_image_strip(images, zoom=1.0, gutter=5):
     num_images, image_height, image_width, channels = images.shape
 
     if channels == 1:
@@ -41,6 +38,14 @@ def create_image_strip(images, zoom=1, gutter=5):
     return np.array(collage)
 
 
+def create_continuous_noise(num_continuous, style_size, size):
+    style = np.random.standard_normal(size=(size, style_size))
+    if num_continuous > 0:
+        continuous = np.random.uniform(-1.0, 1.0, size=(size, num_continuous))
+        return np.hstack([continuous, style])
+    return style
+
+
 class CategoricalPlotter(object):
     def __init__(self,
                  journalist,
@@ -63,40 +68,26 @@ class CategoricalPlotter(object):
         self._image_summaries = {}
 
     def generate_categorical_variations(self, session, row_size, iteration=None):
+        """
+        连续噪声保持不变，只变化类别噪声
+        :param session:
+        :param row_size:
+        :param iteration:
+        :return:
+        """
         images = []
         continuous_noise = create_continuous_noise(
             num_continuous=self.num_continuous,
             style_size=self.style_size,
             size=row_size
         )
-        categorical_noise = create_categorical_noise(
-            categorical_cardinality=self.categorical_cardinality,
-            size=row_size
-        )
-        for c_idx, cardinality in enumerate(self.categorical_cardinality):
-            categorical_noise_modified = [sample.copy() for sample in categorical_noise]
-            for i in range(cardinality):
-                categorical_noise_modified[c_idx][:] = i
-                z_c_vectors = encode_infogan_noise(
-                    categorical_cardinality=self.categorical_cardinality,
-                    categorical_samples=categorical_noise_modified,
-                    continuous_samples=continuous_noise
-                )
-                # show a simpler name when there is only a single categorical
-                # variable
-                if len(self.categorical_cardinality) > 1:
-                    name = "categorical variable %d-%d" % (c_idx, i,)
-                else:
-                    name = "category %d" % (i,)
-                images.append(
-                    (
-                        create_image_strip(
-                            self._generate(session, z_c_vectors),
-                            zoom=self._zoom, gutter=self._gutter
-                        ),
-                        name
-                    )
-                )
+        for i in range(self.categorical_cardinality):
+            one_hot = np.zeros((row_size, self.categorical_cardinality), dtype=np.float32)
+            one_hot[:, i] = 1.0
+            z_c_vectors = np.hstack([one_hot, continuous_noise])
+            name = "category_%d" % (i,)
+            images.append(
+                (create_image_strip(self._generate(session, z_c_vectors), zoom=self._zoom, gutter=self._gutter), name))
         self._add_image_summary(session, images, iteration=iteration)
 
     def _get_placeholder(self, name):
@@ -139,55 +130,43 @@ class CategoricalPlotter(object):
         self._journalist.flush()
 
     def generate_continuous_variations(self, session, row_size, variations=3, iteration=None):
-        categorical_noise = create_categorical_noise(
-            self.categorical_cardinality,
-            size=variations
-        )
+        """
+        连续变量变化，类别变量不变
+        :param session:
+        :param row_size:
+        :param variations:
+        :param iteration:
+        :return:
+        """
+        categorical_noise = np.random.randint(0, self.categorical_cardinality, size=variations)
         continuous_fixed = create_continuous_noise(
             num_continuous=self.num_continuous,
             style_size=self.style_size,
             size=variations
         )
-        linear_variation = np.linspace(-2.0, 2.0, row_size)
+        linear_variation = np.linspace(-1.0, 1.0, row_size)
         images = []
 
         for contig_idx in range(self.num_continuous):
             for var_idx in range(variations):
-                continuous_modified = continuous_fixed[var_idx:var_idx+1, :].repeat(
+                continuous_modified = continuous_fixed[var_idx:var_idx + 1, :].repeat(
                     row_size, axis=0
                 )
-
                 # make this continuous variable vary linearly over the row:
                 continuous_modified[:, contig_idx] = linear_variation
-
-                z_c_vectors = encode_infogan_noise(
-                    self.categorical_cardinality,
-                    [cat[var_idx:var_idx+1].repeat(row_size, axis=0) for cat in categorical_noise],
-                    continuous_modified
-                )
-
+                one_hot = np.zeros((row_size, self.categorical_cardinality), dtype=np.float32)
+                one_hot[:, categorical_noise[var_idx]] = 1.0
+                z_c_vectors = np.hstack([one_hot, continuous_modified])
                 images.append(
-                    (
-                        create_image_strip(
-                            self._generate(session, z_c_vectors),
-                            zoom=self._zoom, gutter=self._gutter
-                        ),
-                        "continuous variable %d, variation %d" % (
-                            contig_idx,
-                            var_idx
-                        )
-                    )
-                )
-
-        self._add_image_summary(
-            session, images, iteration=iteration
-        )
+                    (create_image_strip(self._generate(session, z_c_vectors), zoom=self._zoom, gutter=self._gutter),
+                     "continuous_variable_%d, variation_%d" % (contig_idx, var_idx)))
+        self._add_image_summary(session, images, iteration=iteration)
 
     def generate_images(self, session, row_size, iteration=None):
         self.generate_categorical_variations(
             session, row_size, iteration=iteration
         )
-        self.generate_continuous_variations(
-            session, row_size, variations=3, iteration=iteration
-        )
-
+        if self.num_continuous > 0:
+            self.generate_continuous_variations(
+                session, row_size, variations=3, iteration=iteration
+            )
