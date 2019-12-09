@@ -10,6 +10,8 @@ from os.path import join, realpath, dirname, basename, exists
 from categorical_grid_plots import CategoricalPlotter
 import progressbar
 from random import shuffle
+from tqdm import tqdm
+
 
 SCRIPT_DIR = dirname(realpath(__file__))
 PROJECT_DIR = SCRIPT_DIR
@@ -157,12 +159,10 @@ def main():
     # 前十个为 one hot编码的均匀分布的0~9类别采用，然后是两个均匀分布的数，然后是62个正态分布的数
     discriminator_lr = tf.get_variable(
         "discriminator_lr", (),
-        initializer=tf.constant_initializer(cfg.discriminator_lr)
-    )
+        initializer=tf.constant_initializer(cfg.discriminator_lr), trainable=False)
     generator_lr = tf.get_variable(
         "generator_lr", (),
-        initializer=tf.constant_initializer(cfg.generator_lr)
-    )
+        initializer=tf.constant_initializer(cfg.generator_lr), trainable=False)
     n_images, image_height, image_width, n_channels = X[0].shape
     print("total images: ", n_images)
     true_images = tf.placeholder(tf.float32, [None, image_height, image_width, n_channels], name="true_images")
@@ -177,13 +177,13 @@ def main():
 
     # 训练判别器=======================================================================, 输入是真假图片
     images = tf.concat([fake_images, true_images], axis=0)  # [假，真] 图片
+    #  TODO true_images batch size 有时候是[24]， 不知为啥
     disc = discriminator(
         name="discriminator", inputs=images, is_training=is_training_discriminator,
         use_batchNorm=True, reuse=None, num_category=cfg.num_category, num_continuous=cfg.num_continuous)
     labels_bool = tf.concat([tf.zeros((cfg.batch_size,), tf.float32), tf.ones((cfg.batch_size,), tf.float32)],
                             axis=0)  # [假真]图片
-    labels_bool = tf.print(labels_bool, [tf.shape(labels_bool)], "haha")
-    pp = disc["prob_logits"] # shape 有时候是[81]， 不知为啥
+    pp = disc["prob_logits"]
     discriminator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
         labels=labels_bool[..., tf.newaxis], logits=pp))
 
@@ -191,12 +191,15 @@ def main():
     q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
         labels=true_labels, logits=disc["q_logits"][cfg.batch_size:, :cfg.num_category])) #只用真实图片来做类别训练！！
 
-    final_dis_loss = discriminator_loss + cfg.categorical_lambda * q_cat_loss
+    dis_loss = discriminator_loss + cfg.categorical_lambda * q_cat_loss
     if cfg.num_continuous > 0:
         labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
         q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:cfg.batch_size, cfg.num_category:]))
-        final_dis_loss += cfg.continuous_lambda * q_cont_loss
-
+        dis_loss += cfg.continuous_lambda * q_cont_loss
+    L2_loss = cfg.weight_decay * tf.add_n(
+            [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables("discriminator")
+             if "bn" not in v.name])
+    final_dis_loss = L2_loss + dis_loss
     # 训练生成器 ===============================================================， 输入是假图片
     disc = discriminator(
         name="discriminator", inputs=fake_images, is_training=is_training_discriminator,
@@ -208,20 +211,27 @@ def main():
     q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
         labels=labels_catrgory, logits=disc["q_logits"][:, :cfg.num_category]))
 
-    final_gen_loss = generator_loss + cfg.categorical_lambda * q_cat_loss
+    gen_loss = generator_loss + cfg.categorical_lambda * q_cat_loss
     if cfg.num_continuous > 0:
         labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
         q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:, cfg.num_category:]))
-        final_gen_loss += cfg.continuous_lambda * q_cont_loss
+        gen_loss += cfg.continuous_lambda * q_cont_loss
+    L2_loss = cfg.weight_decay * tf.add_n(
+            [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables("generator")
+             if "bn" not in v.name])
+    final_gen_loss = gen_loss + L2_loss
 
     discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
     generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
 
-    discriminator_variables = scope_variables("discriminator")
-    generator_variables = scope_variables("generator")
+    train_discriminator = discriminator_solver.minimize(final_dis_loss, var_list=tf.trainable_variables("discriminator"))
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, "discriminator")
+    train_discriminator = tf.group(train_discriminator, update_ops)
 
-    train_discriminator = discriminator_solver.minimize(final_dis_loss, var_list=discriminator_variables)
-    train_generator = generator_solver.minimize(final_gen_loss, var_list=generator_variables)
+    train_generator = generator_solver.minimize(final_gen_loss, var_list=tf.trainable_variables("generator"))
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, "generator")
+    train_generator = tf.group(train_generator, update_ops)
+
     discriminator_obj_summary = tf.summary.scalar("discriminator_objective", final_dis_loss)
     generator_obj_summary = tf.summary.scalar("generator_objective", final_gen_loss)
 
@@ -250,14 +260,14 @@ def main():
             gen_epoch_obj = []
 
             shuffle(idxes)
-            pbar = create_progress_bar("epoch %d >> " % (epoch,))
-            for idx in pbar(range(0, n_images, cfg.batch_size)):
+            # pbar = create_progress_bar("epoch %d >> " % (epoch,))
+            for idx in tqdm(range(0, n_images-cfg.batch_size, cfg.batch_size)):
                 batch = X[0][idxes[idx: idx + cfg.batch_size]]  # true image
                 labels = X[1][idxes[idx: idx + cfg.batch_size]]  # true image
                 noise = sample_noise(cfg.batch_size)
                 # 训练判别器
                 _, summary_result1, disc_obj = sess.run(
-                    [train_discriminator, discriminator_obj_summary, final_dis_loss],
+                    [train_discriminator, discriminator_obj_summary, dis_loss],
                     feed_dict={
                         true_images: batch,
                         zc_vectors: noise,
@@ -270,7 +280,7 @@ def main():
                 # 训练生成器和互信息
                 noise = sample_noise(cfg.batch_size)
                 _, summary_result2, gen_obj = sess.run(
-                    [train_generator,  generator_obj_summary, final_gen_loss],
+                    [train_generator,  generator_obj_summary, gen_loss],
                     feed_dict={
                         zc_vectors: noise,
                         is_training_discriminator: True,

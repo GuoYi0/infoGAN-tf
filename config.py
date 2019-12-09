@@ -9,9 +9,10 @@ categorical_lambda = 1.0
 continuous_lambda = 1.0
 fix_std = True  # 把连续变量的方差固定为1.0
 n_epochs = 30
-batch_size = 64
+batch_size = 128
 plot_every = 200
 ckpt = "ckpt"
+weight_decay = 1e-6
 
 
 
