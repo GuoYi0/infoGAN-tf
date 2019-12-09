@@ -1,0 +1,8 @@
+ckpt/*
+mnist_log/*
+mnist/*
+.idea
+.git
+__pycache__
+*/__pycache__
+
