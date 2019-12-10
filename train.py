@@ -177,7 +177,6 @@ def main():
 
     # 训练判别器=======================================================================, 输入是真假图片
     images = tf.concat([fake_images, true_images], axis=0)  # [假，真] 图片
-    #  TODO true_images batch size 有时候是[24]， 不知为啥
     disc = discriminator(
         name="discriminator", inputs=images, is_training=is_training_discriminator,
         use_batchNorm=True, reuse=None, num_category=cfg.num_category, num_continuous=cfg.num_continuous)
@@ -200,6 +199,7 @@ def main():
             [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables("discriminator")
              if "bn" not in v.name])
     final_dis_loss = L2_loss + dis_loss
+
     # 训练生成器 ===============================================================， 输入是假图片
     disc = discriminator(
         name="discriminator", inputs=fake_images, is_training=is_training_discriminator,
@@ -221,9 +221,10 @@ def main():
              if "bn" not in v.name])
     final_gen_loss = gen_loss + L2_loss
 
-    discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
-    generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
-
+    # discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
+    # generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
+    discriminator_solver = tf.train.MomentumOptimizer(learning_rate=discriminator_lr, momentum=0.9)
+    generator_solver = tf.train.MomentumOptimizer(learning_rate=generator_lr, momentum=0.9)
     train_discriminator = discriminator_solver.minimize(final_dis_loss, var_list=tf.trainable_variables("discriminator"))
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, "discriminator")
     train_discriminator = tf.group(train_discriminator, update_ops)
@@ -255,12 +256,15 @@ def main():
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
-        for epoch in range(cfg.n_epochs):
+        for epoch in range(1, cfg.n_epochs+1):
             disc_epoch_obj = []
             gen_epoch_obj = []
-
+            if epoch % (cfg.n_epochs//2) == 0:
+                sess.run(tf.assign(discriminator_lr, discriminator_lr.eval()*0.5))
+                sess.run(tf.assign(generator_lr, generator_lr.eval()*0.5))
             shuffle(idxes)
             # pbar = create_progress_bar("epoch %d >> " % (epoch,))
+            # 减去一个batchsize，以免最后不足一个
             for idx in tqdm(range(0, n_images-cfg.batch_size, cfg.batch_size)):
                 batch = X[0][idxes[idx: idx + cfg.batch_size]]  # true image
                 labels = X[1][idxes[idx: idx + cfg.batch_size]]  # true image
@@ -272,7 +276,7 @@ def main():
                         true_images: batch,
                         zc_vectors: noise,
                         is_training_discriminator: True,
-                        is_training_generator: True,
+                        is_training_generator: False,
                         true_labels: labels
                     }
                 )
@@ -283,11 +287,10 @@ def main():
                     [train_generator,  generator_obj_summary, gen_loss],
                     feed_dict={
                         zc_vectors: noise,
-                        is_training_discriminator: True,
+                        is_training_discriminator: False,
                         is_training_generator: True
                     }
                 )
-
                 journalist.add_summary(summary_result1, iters)
                 journalist.add_summary(summary_result2, iters)
                 journalist.flush()
