@@ -150,7 +150,7 @@ def reconstruct_mutual_info(true_categoricals,
     }
 
 
-def main():
+def main(restore):
     X = load_mnist_dataset()
     dataset_name = "mnist"
     z_size = cfg.style_size + cfg.num_category + cfg.num_continuous
@@ -185,12 +185,13 @@ def main():
     pp = disc["prob_logits"]
     discriminator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
         labels=labels_bool[..., tf.newaxis], logits=pp))
-
+    dis_loss_summary = tf.summary.scalar("dis_loss", discriminator_loss)
     labels_catrgory = tf.concat([zc_vectors[:, :cfg.num_category], true_labels], axis=0)  # [假，真] 类别标签
     q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
         labels=true_labels, logits=disc["q_logits"][cfg.batch_size:, :cfg.num_category])) #只用真实图片来做类别训练！！
-
+    q_cat_loss_summary = tf.summary.scalar("q_dis_cat_loss", q_cat_loss)
     dis_loss = discriminator_loss + cfg.categorical_lambda * q_cat_loss
+    merge_dis_loss_summary = tf.summary.scalar("merge_dis_loss", dis_loss)
     if cfg.num_continuous > 0:
         labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
         q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:cfg.batch_size, cfg.num_category:]))
@@ -199,6 +200,9 @@ def main():
             [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables("discriminator")
              if "bn" not in v.name])
     final_dis_loss = L2_loss + dis_loss
+    discriminator_obj_summary = tf.summary.scalar("final_dis_loss", final_dis_loss)
+    disc_summary = tf.summary.merge([dis_loss_summary, q_cat_loss_summary,merge_dis_loss_summary,discriminator_obj_summary])
+
 
     # 训练生成器 ===============================================================， 输入是假图片
     disc = discriminator(
@@ -207,11 +211,13 @@ def main():
     labels_bool = tf.ones((cfg.batch_size,), tf.float32)
     generator_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
         labels=labels_bool[..., tf.newaxis], logits=disc["prob_logits"]))
+    generator_loss_summary = tf.summary.scalar("gen_loss", generator_loss)
     labels_catrgory = zc_vectors[:, :cfg.num_category]
-    q_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
+    q_gen_cat_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
         labels=labels_catrgory, logits=disc["q_logits"][:, :cfg.num_category]))
-
-    gen_loss = generator_loss + cfg.categorical_lambda * q_cat_loss
+    q_gen_cat_loss_summary = tf.summary.scalar("q_gen_cat_loss", q_gen_cat_loss)
+    gen_loss = generator_loss + cfg.categorical_lambda * q_gen_cat_loss
+    merge_gen_loss_summary = tf.summary.scalar("merge_gen_loss", gen_loss)
     if cfg.num_continuous > 0:
         labels_continuous = zc_vectors[:, cfg.num_category: cfg.num_category + cfg.num_continuous]
         q_cont_loss = -0.5 * tf.reduce_mean(tf.square(labels_continuous - disc["q_logits"][:, cfg.num_category:]))
@@ -220,6 +226,8 @@ def main():
             [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables("generator")
              if "bn" not in v.name])
     final_gen_loss = gen_loss + L2_loss
+    generator_obj_summary = tf.summary.scalar("final_gen_loss", final_gen_loss)
+    gen_summary = tf.summary.merge([generator_loss_summary,q_gen_cat_loss_summary,merge_gen_loss_summary,generator_obj_summary])
 
     # discriminator_solver = tf.train.AdamOptimizer(learning_rate=discriminator_lr, beta1=0.5)
     # generator_solver = tf.train.AdamOptimizer(learning_rate=generator_lr, beta1=0.5)
@@ -233,8 +241,6 @@ def main():
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, "generator")
     train_generator = tf.group(train_generator, update_ops)
 
-    discriminator_obj_summary = tf.summary.scalar("discriminator_objective", final_dis_loss)
-    generator_obj_summary = tf.summary.scalar("generator_objective", final_gen_loss)
 
     log_dir = next_unused_name(
         join(
@@ -256,6 +262,10 @@ def main():
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
+        if restore:
+            ckpt = tf.train.get_checkpoint_state("ckpt")
+            saver.restore(sess, ckpt.model_checkpoint_path)
+            print("restore from: ", ckpt.model_checkpoint_path)
         for epoch in range(1, cfg.n_epochs+1):
             disc_epoch_obj = []
             gen_epoch_obj = []
@@ -271,7 +281,7 @@ def main():
                 noise = sample_noise(cfg.batch_size)
                 # 训练判别器
                 _, summary_result1, disc_obj = sess.run(
-                    [train_discriminator, discriminator_obj_summary, dis_loss],
+                    [train_discriminator, disc_summary, dis_loss],
                     feed_dict={
                         true_images: batch,
                         zc_vectors: noise,
@@ -284,7 +294,7 @@ def main():
                 # 训练生成器和互信息
                 noise = sample_noise(cfg.batch_size)
                 _, summary_result2, gen_obj = sess.run(
-                    [train_generator,  generator_obj_summary, gen_loss],
+                    [train_generator,  gen_summary, gen_loss],
                     feed_dict={
                         zc_vectors: noise,
                         is_training_discriminator: False,
@@ -336,4 +346,4 @@ def next_unused_name(name):
 
 if __name__ == "__main__":
     tf.logging.set_verbosity(tf.logging.INFO)
-    main()
+    main(restore=True)
